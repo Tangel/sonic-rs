@@ -1,4 +1,4 @@
-use std::{cell::Cell, result::Result as StdResult, slice};
+use std::{cell::Cell, mem::ManuallyDrop, result::Result as StdResult, slice};
 
 use ::serde::{
     de::{
@@ -87,7 +87,11 @@ struct NativeValue {
 }
 
 thread_local! {
-    static NATIVE_VALUE: Cell<Option<NativeValue>> = const { Cell::new(None) };
+    // NativeValueGuard empties/restores the slot on every return or unwind.
+    // Only the storage is non-dropping: avoiding TLS destructor registration
+    // keeps the handoff cheap and available during other TLS destructors.
+    static NATIVE_VALUE: ManuallyDrop<Cell<Option<NativeValue>>> =
+        const { ManuallyDrop::new(Cell::new(None)) };
 }
 
 struct NativeValueGuard<'a> {
@@ -589,6 +593,8 @@ impl<'de> VariantAccess<'de> for VariantRefDeserializer<'de> {
     {
         match self.value.map(|v| v.as_ref()) {
             Some(ValueRef::Object(v)) => visit_object_ref(v, visitor),
+            // a struct variant may be written as a sequence, as when deserializing from text
+            Some(ValueRef::Array(v)) => visit_array_ref(v, visitor),
             Some(other) => Err(serde::de::Error::invalid_type(
                 other.unexpected(),
                 &"struct variant",
@@ -847,12 +853,20 @@ impl<'de> serde::Deserializer<'de> for &'de Value {
 
 #[cfg(test)]
 mod test {
+    #[cfg(not(target_family = "wasm"))]
+    use std::{
+        cell::RefCell,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Barrier,
+        },
+        thread,
+    };
     use std::{
         fmt,
         mem::size_of,
         panic::{catch_unwind, AssertUnwindSafe},
-        sync::{Arc, Barrier},
-        thread,
+        sync::Arc,
     };
 
     use serde::{
@@ -1089,6 +1103,10 @@ mod test {
     fn test_native_transfer_cleans_up_on_error_and_panic() {
         let owner = Arc::new(vec![json!({"owned": "value"})]);
         for panic in [false, true] {
+            // Abort-only targets cannot exercise a caught unwind.
+            if panic && !cfg!(panic = "unwind") {
+                continue;
+            }
             let result = catch_unwind(AssertUnwindSafe(|| {
                 visit_native_value(Value::from(owner.clone()), RejectVisitor { panic })
             }));
@@ -1125,6 +1143,9 @@ mod test {
                 let forged = marker.to_vec();
                 assert!(Value::deserialize(BytesDeserializer::<ValueError>::new(&forged)).is_err());
                 for panic in [false, true] {
+                    if panic && !cfg!(panic = "unwind") {
+                        continue;
+                    }
                     let _ = catch_unwind(AssertUnwindSafe(|| {
                         visit_native_value(json!({"nested": "unclaimed"}), RejectVisitor { panic })
                     }));
@@ -1142,6 +1163,7 @@ mod test {
         );
     }
 
+    #[cfg(not(target_family = "wasm"))]
     #[test]
     fn test_native_transfer_is_thread_local() {
         struct Concurrent(Arc<Barrier>);
@@ -1172,6 +1194,62 @@ mod test {
             .collect();
         for thread in threads {
             thread.join().unwrap();
+        }
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn test_value_deserializes_during_thread_local_cleanup() {
+        struct OnExit(Arc<AtomicBool>);
+
+        impl Drop for OnExit {
+            fn drop(&mut self) {
+                self.0.store(
+                    from_value::<Value>(&Value::from(42)).is_ok(),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+
+        thread_local! {
+            static ON_EXIT: RefCell<Option<OnExit>> = const { RefCell::new(None) };
+        }
+
+        let completed = Arc::new(AtomicBool::new(false));
+        let observed = completed.clone();
+        thread::spawn(move || {
+            // Register this destructor before initializing the native handoff.
+            ON_EXIT.with(|slot| *slot.borrow_mut() = Some(OnExit(observed)));
+            assert_eq!(
+                from_value::<Value>(&Value::from(42)).unwrap().as_i64(),
+                Some(42)
+            );
+        })
+        .join()
+        .unwrap();
+        assert!(completed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_struct_variant_from_value_sequence() {
+        // A struct variant written as a sequence deserializes from text; from a Value it failed
+        // with "invalid type: sequence, expected struct variant".
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum E {
+            S { a: u8, b: String },
+        }
+        use crate::{from_str, from_value, Value};
+        let text = r#"{"S":[5,"k"]}"#;
+        let expected = E::S {
+            a: 5,
+            b: "k".to_owned(),
+        };
+        assert_eq!(from_str::<E>(text).unwrap(), expected);
+        let v: Value = from_str(text).unwrap();
+        assert_eq!(from_value::<E>(&v).unwrap(), expected);
+        for bad in [r#"{"S":[5]}"#, r#"{"S":[5,"k",1]}"#] {
+            let v: Value = from_str(bad).unwrap();
+            assert!(from_value::<E>(&v).is_err(), "{bad}");
         }
     }
 }

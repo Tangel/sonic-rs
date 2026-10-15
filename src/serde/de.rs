@@ -12,7 +12,7 @@ use sonic_number::ParserNumber;
 use crate::{
     error::{
         Error,
-        ErrorCode::{self, EofWhileParsing, RecursionLimitExceeded},
+        ErrorCode::{self, EofWhileParsing},
         Result,
     },
     parser::{as_str, ParseStatus, ParsedSlice, Parser, Reference},
@@ -20,7 +20,6 @@ use crate::{
     value::{de::visit_native_value, node::Value, shared::Shared},
     JsonInput, OwnedLazyValue,
 };
-const MAX_ALLOWED_DEPTH: u8 = u8::MAX;
 
 //////////////////////////////////////////////////////////////////////////////
 
@@ -28,7 +27,6 @@ const MAX_ALLOWED_DEPTH: u8 = u8::MAX;
 pub struct Deserializer<R> {
     pub(crate) parser: Parser<R>,
     scratch: Vec<u8>,
-    remaining_depth: u8,
     shared: Option<Arc<Shared>>, // the shared allocator for `Value`
 }
 
@@ -39,7 +37,6 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
         Self {
             parser: Parser::new(read),
             scratch: Vec::new(),
-            remaining_depth: MAX_ALLOWED_DEPTH,
             shared: Option::None,
         }
     }
@@ -199,6 +196,12 @@ where
         if self.is_ending {
             return None;
         }
+        // Only whitespace left: the stream is done (as serde_json's `StreamDeserializer`), not an
+        // EOF error. A value that starts but is cut short is still an error.
+        if self.de.parser.skip_space_peek().is_none() {
+            self.is_ending = true;
+            return None;
+        }
         let val: Result<T> = self.de.deserialize();
         if val.is_err() {
             self.is_ending = true;
@@ -229,12 +232,9 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
     where
         F: FnOnce(&mut Self) -> Result<T>,
     {
-        self.remaining_depth -= 1;
-        if self.remaining_depth == 0 {
-            return Err(self.parser.error(RecursionLimitExceeded));
-        }
+        self.parser.enter_nested()?;
         let result = f(self);
-        self.remaining_depth += 1;
+        self.parser.leave_nested();
         result
     }
 }
@@ -378,14 +378,32 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
             let json = self.parser.read.as_u8_slice();
 
             // get n to check trailing characters in later
-            let n = if cfg.utf8_lossy && self.parser.read.next_invalid_utf8() != usize::MAX {
+            if cfg.utf8_lossy && self.parser.read.next_invalid_utf8() != usize::MAX {
                 // repr the invalid utf8, not need to care about the invalid UTF8 char in non-string
                 // parts, it will cause errors when parsing.
-                val.parse_with_padding(String::from_utf8_lossy(json).as_bytes(), cfg)?
+                let lossy = String::from_utf8_lossy(json);
+                let n = val.parse_with_padding(lossy.as_bytes(), cfg)?;
+                // `n` is an offset into the lossy copy, where every invalid sequence became the
+                // 3-byte U+FFFD, so it is not an offset into `json`. What follows the value is
+                // the same in both (whitespace or trailing characters; invalid UTF-8 there is a
+                // trailing-character error either way), so count it from the end.
+                // `n` past the end means the parser ran into the padding (unterminated input):
+                // keep it past the end of `json` by the same amount, so that is still reported.
+                let consumed = if n >= lossy.len() {
+                    json.len() + (n - lossy.len())
+                } else {
+                    json.len() - (lossy.len() - n)
+                };
+                self.parser.read.eat(consumed);
+                // the invalid UTF-8 inside the value has been replaced: look for it only in the
+                // part that is still to be read (if any; past the end is reported as EOF)
+                if consumed <= json.len() {
+                    self.parser.read.check_invalid_utf8();
+                }
             } else {
-                val.parse_with_padding(json, cfg)?
-            };
-            self.parser.read.eat(n);
+                let n = val.parse_with_padding(json, cfg)?;
+                self.parser.read.eat(n);
+            }
         } else {
             let shared = unsafe {
                 if self.shared.is_none() {

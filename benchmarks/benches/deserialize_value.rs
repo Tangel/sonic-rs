@@ -1,9 +1,9 @@
 #[macro_use]
 extern crate criterion;
 
-use std::{fs::File, io::Read, str::from_utf8_unchecked};
+use std::{fs::File, hint::black_box, io::Read, str::from_utf8_unchecked};
 
-use criterion::{criterion_group, BatchSize, Criterion, SamplingMode, Throughput};
+use criterion::{BatchSize, Criterion, SamplingMode, Throughput, criterion_group};
 
 include!("./common.rs");
 
@@ -11,29 +11,34 @@ include!("./common.rs");
 #[global_allocator]
 static GLOBAL: jemallocator::Jemalloc = jemallocator::Jemalloc;
 
+// Materialize the DOM before timed drop; black-boxing only () cannot protect it.
 fn simdjson_to_borrowed_value(data: &mut [u8]) {
-    let _ = simd_json::to_borrowed_value(data).unwrap();
+    black_box(simd_json::to_borrowed_value(black_box(data)).unwrap());
 }
 
 fn simdjson_to_owned_value(data: &mut [u8]) {
-    let _ = simd_json::to_owned_value(data).unwrap();
+    black_box(simd_json::to_owned_value(black_box(data)).unwrap());
 }
 
 fn serde_from_slice(data: &[u8]) {
-    let _: serde_json::Value = serde_json::from_slice(data).unwrap();
+    let value: serde_json::Value = serde_json::from_slice(black_box(data)).unwrap();
+    black_box(value);
 }
 
 fn serde_from_str(data: &[u8]) {
     let data = unsafe { from_utf8_unchecked(data) };
-    let _: serde_json::Value = serde_json::from_str(data).unwrap();
+    let value: serde_json::Value = serde_json::from_str(black_box(data)).unwrap();
+    black_box(value);
 }
 
 fn sonic_rs_from_slice(data: &[u8], cfg: SonicConfig) {
-    let _: sonic_rs::Value = do_sonic_rs_from_slice(data, cfg).unwrap();
+    black_box(do_sonic_rs_from_slice(black_box(data), cfg).unwrap());
 }
 
 fn sonic_rs_from_slice_unchecked(data: &[u8]) {
-    let _: sonic_rs::Value = unsafe { sonic_rs::from_slice_unchecked(data).unwrap() };
+    let value: sonic_rs::Value =
+        unsafe { sonic_rs::from_slice_unchecked(black_box(data)).unwrap() };
+    black_box(value);
 }
 
 // fn sonic_rs_skip_one(data: &[u8]) {
@@ -45,11 +50,13 @@ fn sonic_rs_from_slice_unchecked(data: &[u8]) {
 // }
 
 fn sonic_rs_to_serdejson_value(data: &[u8]) {
-    let _: serde_json::Value = sonic_rs::from_slice(data).unwrap();
+    let value: serde_json::Value = sonic_rs::from_slice(black_box(data)).unwrap();
+    black_box(value);
 }
 
 fn sonic_rs_to_simdjson_value(data: &[u8]) {
-    let _: simd_json::OwnedValue = sonic_rs::from_slice(data).unwrap();
+    let value: simd_json::OwnedValue = sonic_rs::from_slice(black_box(data)).unwrap();
+    black_box(value);
 }
 
 macro_rules! bench_file {
