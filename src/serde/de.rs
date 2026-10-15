@@ -17,7 +17,7 @@ use crate::{
     },
     parser::{as_str, ParseStatus, ParsedSlice, Parser, Reference},
     reader::{Read, Reader},
-    value::{node::Value, shared::Shared},
+    value::{de::visit_native_value, node::Value, shared::Shared},
     JsonInput, OwnedLazyValue,
 };
 const MAX_ALLOWED_DEPTH: u8 = u8::MAX;
@@ -403,15 +403,7 @@ impl<'de, R: Reader<'de>> Deserializer<R> {
             val.parse_without_padding(shared, &mut self.scratch, &mut self.parser)?
         };
 
-        let val = ManuallyDrop::new(val);
-        // #Safety
-        // the json is validate before parsing json, and we pass the document using visit_bytes
-        // here.
-        unsafe {
-            let binary =
-                &*slice_from_raw_parts(&val as *const _ as *const u8, std::mem::size_of::<Value>());
-            visitor.visit_bytes(binary)
-        }
+        visit_native_value(val, visitor)
     }
 
     // we deserialize json number from string or number types

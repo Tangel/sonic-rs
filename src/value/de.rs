@@ -1,4 +1,4 @@
-use std::{mem::MaybeUninit, result::Result as StdResult, slice};
+use std::{cell::Cell, result::Result as StdResult, slice};
 
 use ::serde::{
     de::{
@@ -81,6 +81,46 @@ impl<'de> Deserialize<'de> for Value {
 
 pub(crate) const TOKEN: &str = "$sonic_rs::private::Value";
 
+struct NativeValue {
+    marker: *const u8,
+    value: Value,
+}
+
+thread_local! {
+    static NATIVE_VALUE: Cell<Option<NativeValue>> = const { Cell::new(None) };
+}
+
+struct NativeValueGuard<'a> {
+    slot: &'a Cell<Option<NativeValue>>,
+    previous: Option<NativeValue>,
+}
+
+impl Drop for NativeValueGuard<'_> {
+    fn drop(&mut self) {
+        // Restore a reentrant caller and drop any value the visitor did not take.
+        self.slot.set(self.previous.take());
+    }
+}
+
+/// Transfer an already parsed DOM without exposing its representation to Serde.
+#[inline]
+pub(crate) fn visit_native_value<'de, V>(value: Value, visitor: V) -> Result<V::Value, Error>
+where
+    V: Visitor<'de>,
+{
+    NATIVE_VALUE
+        .try_with(|slot| {
+            let mut marker = [0_u8];
+            let previous = slot.replace(Some(NativeValue {
+                marker: marker.as_mut_ptr(),
+                value,
+            }));
+            let _guard = NativeValueGuard { slot, previous };
+            visitor.visit_bytes(&marker)
+        })
+        .map_err(|_| <Error as de::Error>::custom("native JSON value transfer is unavailable"))?
+}
+
 pub(crate) struct ValueVisitor;
 
 impl<'de> Visitor<'de> for ValueVisitor {
@@ -90,25 +130,113 @@ impl<'de> Visitor<'de> for ValueVisitor {
         formatter.write_str("a valid json")
     }
 
-    fn visit_bytes<E>(self, value_binary: &[u8]) -> StdResult<Value, E>
+    fn visit_newtype_struct<D>(self, deserializer: D) -> StdResult<Value, D::Error>
     where
-        E: de::Error,
+        D: de::Deserializer<'de>,
     {
-        // we pass the value from value_binary
-        unsafe {
-            assert!(
-                value_binary.len() == std::mem::size_of::<Value>(),
-                "invalid value size {}",
-                value_binary.len()
-            );
-            let mut dom: MaybeUninit<Value> = MaybeUninit::zeroed();
-            std::ptr::copy_nonoverlapping(
-                value_binary.as_ptr() as *const Value,
-                dom.as_mut_ptr(),
-                1,
-            );
-            Ok(dom.assume_init())
+        deserializer.deserialize_any(self)
+    }
+
+    fn visit_unit<E: de::Error>(self) -> StdResult<Value, E> {
+        Ok(Value::new_null())
+    }
+
+    fn visit_none<E: de::Error>(self) -> StdResult<Value, E> {
+        self.visit_unit()
+    }
+
+    fn visit_some<D>(self, deserializer: D) -> StdResult<Value, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        Value::deserialize(deserializer)
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> StdResult<Value, E> {
+        Ok(Value::new_bool(value))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> StdResult<Value, E> {
+        Ok(Value::new_i64(value))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> StdResult<Value, E> {
+        Ok(Value::new_u64(value))
+    }
+
+    fn visit_i128<E: de::Error>(self, value: i128) -> StdResult<Value, E> {
+        if let Ok(value) = i64::try_from(value) {
+            return self.visit_i64(value);
         }
+        if let Ok(value) = u64::try_from(value) {
+            return self.visit_u64(value);
+        }
+        #[cfg(feature = "arbitrary_precision")]
+        return Ok(Value::new_rawnum_faststr(&value.to_string().into()));
+        #[cfg(not(feature = "arbitrary_precision"))]
+        Err(E::custom("integer out of range"))
+    }
+
+    fn visit_u128<E: de::Error>(self, value: u128) -> StdResult<Value, E> {
+        if let Ok(value) = u64::try_from(value) {
+            return self.visit_u64(value);
+        }
+        #[cfg(feature = "arbitrary_precision")]
+        return Ok(Value::new_rawnum_faststr(&value.to_string().into()));
+        #[cfg(not(feature = "arbitrary_precision"))]
+        Err(E::custom("integer out of range"))
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> StdResult<Value, E> {
+        Value::new_f64(value).ok_or_else(|| E::invalid_value(Unexpected::Float(value), &self))
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> StdResult<Value, E> {
+        Ok(Value::copy_str(value))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> StdResult<Value, E> {
+        Ok(Value::new_faststr(value.into()))
+    }
+
+    fn visit_seq<A>(self, mut sequence: A) -> StdResult<Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        // Size hints are untrusted; grow normally beyond this initial reservation.
+        let mut value = Value::new_array_with(sequence.size_hint().unwrap_or_default().min(4096));
+        while let Some(element) = sequence.next_element::<Value>()? {
+            value.append_value(element);
+        }
+        Ok(value)
+    }
+
+    fn visit_map<A>(self, mut map: A) -> StdResult<Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut value = Value::new_object_with(map.size_hint().unwrap_or_default().min(4096));
+        while let Some((key, element)) = map.next_entry::<String, Value>()? {
+            value.insert(&key, element);
+        }
+        Ok(value)
+    }
+
+    #[inline]
+    fn visit_bytes<E: de::Error>(self, bytes: &[u8]) -> StdResult<Value, E> {
+        // Only the actual borrowed marker from the active native call can take
+        // its owned value. Contents (including a copied marker) confer no access.
+        NATIVE_VALUE
+            .try_with(|slot| match slot.take() {
+                Some(native) if bytes.len() == 1 && bytes.as_ptr() == native.marker => {
+                    Ok(native.value)
+                }
+                previous => {
+                    slot.set(previous);
+                    Err(E::invalid_type(Unexpected::Bytes(bytes), &self))
+                }
+            })
+            .map_err(|_| E::custom("native JSON value transfer is unavailable"))?
     }
 }
 
@@ -566,12 +694,15 @@ impl<'de> serde::Deserializer<'de> for &'de Value {
     #[inline]
     fn deserialize_newtype_struct<V>(
         self,
-        _name: &'static str,
+        name: &'static str,
         visitor: V,
     ) -> Result<V::Value, Error>
     where
         V: Visitor<'de>,
     {
+        if name == TOKEN {
+            return visit_native_value(self.clone(), visitor);
+        }
         visitor.visit_newtype_struct(self)
     }
 
@@ -716,9 +847,331 @@ impl<'de> serde::Deserializer<'de> for &'de Value {
 
 #[cfg(test)]
 mod test {
+    use std::{
+        fmt,
+        mem::size_of,
+        panic::{catch_unwind, AssertUnwindSafe},
+        sync::{Arc, Barrier},
+        thread,
+    };
+
+    use serde::{
+        de::{
+            self,
+            value::{
+                BoolDeserializer, BorrowedBytesDeserializer, BytesDeserializer,
+                Error as ValueError, F64Deserializer, I128Deserializer, MapDeserializer,
+                SeqDeserializer, StrDeserializer, U128Deserializer,
+            },
+            DeserializeSeed, MapAccess, SeqAccess, Visitor,
+        },
+        Deserialize,
+    };
+
+    use super::{visit_native_value, Value, ValueVisitor};
+    use crate::{from_str, from_value, json, to_string, Array, JsonValueTrait, Object};
 
     #[test]
     fn test_value_as_deserializer() {
-        // unimplemented!()
+        let original = json!({"items": [null, true, -1, 1.25, "温度"], "empty": {}});
+        let actual: Value = from_value(&original).unwrap();
+        assert_eq!(actual, original);
+        drop(original);
+        assert_eq!(actual["items"][4].as_str(), Some("温度"));
+    }
+
+    #[test]
+    fn test_value_from_foreign_json() {
+        for expected in [
+            serde_json::json!(null),
+            serde_json::json!(true),
+            serde_json::json!(i64::MIN),
+            serde_json::json!(u64::MAX),
+            serde_json::json!(1.25),
+            serde_json::json!("温度\n café"),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!({"nested": [{"value": [null, false, 42]}]}),
+        ] {
+            let actual: Value = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(serde_json::to_value(actual).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn test_direct_value_deserializers() {
+        let boolean = Value::deserialize(BoolDeserializer::<ValueError>::new(true)).unwrap();
+        assert_eq!(boolean.as_bool(), Some(true));
+        let string = Value::deserialize(StrDeserializer::<ValueError>::new("borrowed")).unwrap();
+        assert_eq!(string.as_str(), Some("borrowed"));
+        let array = Value::deserialize(SeqDeserializer::<_, ValueError>::new(
+            [true, false].into_iter(),
+        ))
+        .unwrap();
+        assert_eq!(array, json!([true, false]));
+    }
+
+    #[test]
+    fn test_generic_array_and_object() {
+        let array: Array = serde_json::from_value(serde_json::json!([1, {"a": true}])).unwrap();
+        assert_eq!(
+            serde_json::to_value(array).unwrap(),
+            serde_json::json!([1, {"a": true}])
+        );
+        let object: Object = serde_json::from_value(serde_json::json!({"a": [1, 2]})).unwrap();
+        assert_eq!(
+            serde_json::to_value(object).unwrap(),
+            serde_json::json!({"a": [1, 2]})
+        );
+        assert!(serde_json::from_value::<Array>(serde_json::json!({})).is_err());
+        assert!(serde_json::from_value::<Object>(serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn test_generic_nested_value_field() {
+        #[derive(Deserialize)]
+        struct Envelope {
+            payload: Value,
+            optional: Option<Value>,
+        }
+
+        let value: Envelope =
+            serde_json::from_str(r#"{"payload":{"items":[1,null,true]},"optional":"owned"}"#)
+                .unwrap();
+        assert_eq!(value.payload, json!({"items": [1, null, true]}));
+        assert_eq!(value.optional.unwrap().as_str(), Some("owned"));
+        let native: Envelope = from_str(r#"{"payload":{"a":[1,2]},"optional":null}"#).unwrap();
+        assert_eq!(native.payload, json!({"a": [1, 2]}));
+        assert!(native.optional.is_none());
+    }
+
+    #[test]
+    fn test_direct_bytes_return_errors_without_panicking() {
+        for bytes in [
+            &[][..],
+            &[0_u8][..],
+            &[0_u8; size_of::<Value>()][..],
+            &[0xff_u8; size_of::<Value>()][..],
+            &[0_u8; 17][..],
+        ] {
+            let result =
+                catch_unwind(|| Value::deserialize(BytesDeserializer::<ValueError>::new(bytes)));
+            assert!(result.is_ok(), "ordinary bytes must not panic");
+            assert!(result.unwrap().is_err());
+            assert!(
+                Value::deserialize(BorrowedBytesDeserializer::<ValueError>::new(bytes)).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_generic_numeric_boundaries() {
+        let minimum =
+            Value::deserialize(I128Deserializer::<ValueError>::new(i64::MIN as i128)).unwrap();
+        assert_eq!(minimum.as_i64(), Some(i64::MIN));
+        let maximum =
+            Value::deserialize(U128Deserializer::<ValueError>::new(u64::MAX as u128)).unwrap();
+        assert_eq!(maximum.as_u64(), Some(u64::MAX));
+        for number in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(Value::deserialize(F64Deserializer::<ValueError>::new(number)).is_err());
+        }
+    }
+
+    #[test]
+    fn test_nested_bytes_and_non_string_keys_are_rejected() {
+        let bytes = [0xff_u8; size_of::<Value>()];
+        let sequence = SeqDeserializer::<_, ValueError>::new(
+            [BytesDeserializer::<ValueError>::new(&bytes)].into_iter(),
+        );
+        assert!(Value::deserialize(sequence).is_err());
+        let map = MapDeserializer::<_, ValueError>::new(
+            [("payload", BytesDeserializer::<ValueError>::new(&bytes))].into_iter(),
+        );
+        assert!(Value::deserialize(map).is_err());
+        let map = MapDeserializer::<_, ValueError>::new([(true, 1_u64)].into_iter());
+        assert!(Value::deserialize(map).is_err());
+    }
+
+    #[test]
+    fn test_generic_128_bit_range() {
+        for number in [i128::MIN, i128::MAX] {
+            let result = Value::deserialize(I128Deserializer::<ValueError>::new(number));
+            if cfg!(feature = "arbitrary_precision") {
+                assert_eq!(to_string(&result.unwrap()).unwrap(), number.to_string());
+            } else {
+                assert!(result.is_err());
+            }
+        }
+        let result = Value::deserialize(U128Deserializer::<ValueError>::new(u128::MAX));
+        if cfg!(feature = "arbitrary_precision") {
+            assert_eq!(to_string(&result.unwrap()).unwrap(), u128::MAX.to_string());
+        } else {
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "arbitrary_precision")]
+    fn test_native_value_preserves_raw_numbers() {
+        for json in [
+            "1.2345678901234567890123456789",
+            "1234567890123456789012345678901234567890",
+        ] {
+            let original: Value = from_str(json).unwrap();
+            let actual: Value = from_value(&original).unwrap();
+            assert_eq!(to_string(&actual).unwrap(), json);
+        }
+    }
+
+    #[test]
+    fn test_untrusted_container_size_hints_are_bounded() {
+        struct Empty;
+
+        impl<'de> SeqAccess<'de> for Empty {
+            type Error = ValueError;
+
+            fn next_element_seed<T>(&mut self, _seed: T) -> Result<Option<T::Value>, ValueError>
+            where
+                T: DeserializeSeed<'de>,
+            {
+                Ok(None)
+            }
+
+            fn size_hint(&self) -> Option<usize> {
+                Some(usize::MAX)
+            }
+        }
+
+        impl<'de> MapAccess<'de> for Empty {
+            type Error = ValueError;
+
+            fn next_key_seed<K>(&mut self, _seed: K) -> Result<Option<K::Value>, ValueError>
+            where
+                K: DeserializeSeed<'de>,
+            {
+                Ok(None)
+            }
+
+            fn next_value_seed<V>(&mut self, _seed: V) -> Result<V::Value, ValueError>
+            where
+                V: DeserializeSeed<'de>,
+            {
+                Err(de::Error::custom("empty map has no value"))
+            }
+
+            fn size_hint(&self) -> Option<usize> {
+                Some(usize::MAX)
+            }
+        }
+
+        assert_eq!(ValueVisitor.visit_seq(Empty).unwrap(), json!([]));
+        assert_eq!(ValueVisitor.visit_map(Empty).unwrap(), json!({}));
+    }
+
+    struct RejectVisitor {
+        panic: bool,
+    }
+
+    impl<'de> Visitor<'de> for RejectVisitor {
+        type Value = ();
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a rejected transfer")
+        }
+
+        fn visit_bytes<E: de::Error>(self, _bytes: &[u8]) -> Result<(), E> {
+            assert!(!self.panic, "visitor panic");
+            Err(E::custom("visitor rejection"))
+        }
+    }
+
+    #[test]
+    fn test_native_transfer_cleans_up_on_error_and_panic() {
+        let owner = Arc::new(vec![json!({"owned": "value"})]);
+        for panic in [false, true] {
+            let result = catch_unwind(AssertUnwindSafe(|| {
+                visit_native_value(Value::from(owner.clone()), RejectVisitor { panic })
+            }));
+            if panic {
+                assert!(result.is_err());
+            } else {
+                assert!(result.unwrap().is_err());
+            }
+            assert_eq!(
+                Arc::strong_count(&owner),
+                1,
+                "unclaimed DOM must be dropped"
+            );
+        }
+        assert_eq!(from_str::<Value>("[1,2]").unwrap(), json!([1, 2]));
+    }
+
+    #[test]
+    fn test_native_transfer_is_reentrant_and_one_shot() {
+        struct Reentrant;
+
+        impl<'de> Visitor<'de> for Reentrant {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("the original DOM")
+            }
+
+            fn visit_bytes<E: de::Error>(self, marker: &[u8]) -> Result<Value, E> {
+                assert_eq!(
+                    from_str::<Value>("[true,null]").unwrap(),
+                    json!([true, null])
+                );
+                let forged = marker.to_vec();
+                assert!(Value::deserialize(BytesDeserializer::<ValueError>::new(&forged)).is_err());
+                for panic in [false, true] {
+                    let _ = catch_unwind(AssertUnwindSafe(|| {
+                        visit_native_value(json!({"nested": "unclaimed"}), RejectVisitor { panic })
+                    }));
+                }
+                let value = ValueVisitor.visit_bytes(marker)?;
+                assert!(ValueVisitor.visit_bytes::<E>(marker).is_err());
+                Ok(value)
+            }
+        }
+
+        let expected = json!({"outer": [1, "retained"]});
+        assert_eq!(
+            visit_native_value(expected.clone(), Reentrant).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn test_native_transfer_is_thread_local() {
+        struct Concurrent(Arc<Barrier>);
+
+        impl<'de> Visitor<'de> for Concurrent {
+            type Value = Value;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("this thread's DOM")
+            }
+
+            fn visit_bytes<E: de::Error>(self, marker: &[u8]) -> Result<Value, E> {
+                self.0.wait();
+                ValueVisitor.visit_bytes(marker)
+            }
+        }
+
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = (0_u64..2)
+            .map(|number| {
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    let value =
+                        visit_native_value(Value::from(number), Concurrent(barrier)).unwrap();
+                    assert_eq!(value.as_u64(), Some(number));
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
     }
 }
